@@ -1,0 +1,157 @@
+#include <metal_stdlib>
+using namespace metal;
+
+#define zero 0
+#define eps 0.005
+#define far 140.0
+#define torus float2(40.0, 18.0)
+
+#define c 1.0
+#define ch 0.5
+#define ch2 0.51
+
+// rotation
+float2x2 rot(float x) {
+  return float2x2(cos(x), -sin(x),
+                  -sin(x), cos(x));
+}
+
+float dBox(float3 ro, float3 rd) {
+  float3 m = 1.0 / rd;
+  float3 t = -m * ro + abs(m) * ch2;
+  return min(min(t.x, t.y), t.z);
+}
+
+// quick hue rotation formula...
+float3 rotHue(float3 p, float a) {
+  float2 cs = sin(float2(1.570796,0) + a);
+
+  float3x3 hr = float3x3(0.299,  0.587,  0.114,  0.299,  0.587,  0.114,  0.299,  0.587,  0.114) +
+    float3x3(0.701, -0.587, -0.114, -0.299,  0.413, -0.114, -0.300, -0.588,  0.886) * cs.x +
+    float3x3(0.168,  0.330, -0.497, -0.328,  0.035,  0.292,  1.250, -1.050, -0.203) * cs.y;
+
+  return clamp(p*hr,0.,1.);
+}
+
+// sin-less hash
+float2 hash23(float3 p3) {
+  p3 = fract(p3 * float3(.1031, .1030, .0973));
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+// distance field stuff
+float box(float3 p, float3 b) {
+  float3 d = abs(p) - b;
+  return min(max(d.x, max(d.y, d.z)), 0.0) + length(max(d, 0.0));
+}
+
+float boxedWall(float3 p, float3 rd, float time) {
+  float adjustedTime = time * 0.4;
+  p.y += adjustedTime * 25.0;
+  float3 qd = fract(p / c) * c - ch;
+  float3 qid = floor(p / c);
+  float2 h2 = hash23(qid);
+  float t = dBox(qd, rd);
+  if (p.z > (torus.x - torus.y)) {
+    qd.yz = qd.yz * rot(h2.y + h2.x * time);
+    qd.zx = qd.zx * rot(h2.x + h2.y * time);
+    t = min(t, box(qd, float3(0.3)));
+  }
+  return t;
+}
+
+float map(float3 p, float3 rd, float time) {
+  return boxedWall(p, rd, time);
+}
+
+float3 normal(float3 p, float3 rd, float time) {
+  float4 n = float4(0.0);
+  for (int i = zero; i < 4; i++) {
+    float4 s = float4(p, 0.0);
+    s[i] += eps;
+    n[i] = map(s.xyz, rd, time);
+  }
+  return normalize(n.xyz - n.w);
+}
+
+float4 render(float3 ro, float3 rd, float time) {
+  float3 pc = float3(0);
+  float3 lp = float3(-10, 8, -8);
+  float3 sc = rotHue(float3(1.0, 0.5, 0.1), time * 0.3);
+
+  float t = 0.0;
+  float minT = far;
+  for (int i=0; i < 360; i++) {
+    float ns = map(ro + rd * t, rd, time);
+    if (ns < eps) {
+        break;
+    }
+    t += ns;
+    if (t > far) {
+      t = -1.0;
+      break;
+    }
+  }
+
+  if (t > 0.0) {
+    minT = t;
+    float3 p = ro + rd * t;
+    float3 n = normal(p,rd, time);
+    float3 ld = normalize(lp - p);
+    float lt = length(lp - p);
+    float spec = pow(max(dot(reflect(-ld, n), -rd), 0.0), 32.0);
+
+    pc += sc * 0.4 * max(0.05,dot(ld,n)) / (1. + lt * lt * 0.02);
+    pc += sc * spec * 2.0;
+    pc += float3(0.6, 0.1, 0.8) * 0.01 * max(0.0, n.y);
+  }
+
+  pc *= exp(-0.06 * minT);
+  pc = pow(pc, float3(0.43545));
+
+  return float4(pc, minT);
+}
+
+float3x3 camera(float3 la, float3 ro, float cr) {
+  float3 cw = normalize(la - ro);
+  float3 cp = float3(sin(cr),cos(cr), 0.0);
+  float3 cu = normalize(cross(cw, cp));
+  float3 cv = (cross(cu, cw));
+
+  return float3x3(cu, cv, cw);
+}
+
+kernel void comeOnYouPainter(texture2d<float, access::write> o[[texture(0)]],
+                             constant float &time [[buffer(0)]],
+                             constant float2 *touchEvent [[buffer(1)]],
+                             constant int &numberOfTouches [[buffer(2)]],
+                             ushort2 gid [[thread_position_in_grid]]) {
+
+  int width = o.get_width();
+  int height = o.get_height();
+  float2 res = float2(width, height);
+  float2 p = float2(gid.xy);
+
+  float adjustedTime = time - 4.1;
+  float3 pc = float3(0);
+  float3 la = float3(0, -10, 20);
+  float3 ro = float3(sin(adjustedTime * 0.2) * 20.0, -20.0, -5.0 + cos(adjustedTime * 0.31) * 3.0);
+  ro.x -= ro.y * ro.y * 0.02 * sin(adjustedTime * 0.3);
+
+  float fl = 1.4;
+  float3x3 cam = camera(la, ro, 0.0);
+
+  float2 uv = (2.0 * (p) - res.xy) / res.y;
+  float3 rd = cam * normalize(float3(uv, fl));
+  float4 scene = render(ro, rd, time);
+  pc = scene.xyz;
+
+  pc = 1.15 * pow(pc, float3(0.9, 0.95, 1.0)) + float3(-0.04, -0.04, 0.0);
+  pc = pow(pc,float3(0.80, 0.85, 0.9));
+  pc *= 1.0 / (1.0 + length(uv) * length(uv) * 0.2);
+
+  float4 color = float4(pc * 2.4, 1.0);
+
+  o.write(color, gid);
+}
